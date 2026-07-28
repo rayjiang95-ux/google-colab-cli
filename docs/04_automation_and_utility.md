@@ -1,5 +1,6 @@
 ---
 log:
+2026-07-28: Made DriveFS history writes best-effort so audit-backend failures cannot prevent the kernel reply. The hook now attempts at most one success or failure reply per request, records controlled logging/reply errors for a final nonzero CLI exit, and never includes the original history or reply exception text.
 2026-07-28: Aligned DriveFS credential propagation with the current `colab-vscode` v2 contract: each dry-run/final call obtains an XSRF token then performs a bodyless POST, strictly validates `success`, uses an explicit Colab `input_reply` bound to the Jupyter client session, sends a redacted failure reply, and makes `auth`/`drivemount` exit nonzero on propagation or remote kernel errors. Added protocol, redaction, and exit-status tests; no live runtime or Drive mount was used.
 2026-06-11: Replaced the `oauth2` provider's `run_local_server()` (localhost redirect) with a remote copy-paste flow (`_run_remote_flow` in `auth.py`). The CLI now prints an authorization URL built with `redirect_uri=https://sdk.cloud.google.com/applicationdefaultauthcode.html` and `token_usage=remote`, then reads the pasted authorization code via `input()` and exchanges it with `flow.fetch_token(code=...)`. This is the same flow `gcloud auth application-default login` uses and works identically in local and remote/headless/container environments, removing the heuristic of whether to auto-open a browser. Confirmed server-side acceptance with a live GET-only check against the bundled cloud-SDK client (`764086051850-...`); the OOB redirect and a non-bundled client id were both verified to be rejected (`OOB flow has been blocked` / `redirect_uri_mismatch`). Unit tests in `tests/test_auth.py` assert no localhost server is started, the redirect URI + `token_usage=remote` are set, and the pasted code is exchanged.
 2026-06-01: Enabled `colab update --install` self-update on macOS in addition to Linux. Refactored platform check logic to keep the implementation DRY and updated both tests and documentation. Also, on these platforms, an additional message is shown recommending `colab update --install` to upgrade in place, positioned above the standard `pip`/`uv` installation command.
@@ -150,6 +151,11 @@ remediation guidance) rather than silently after ~1 minute via the daemon.
 -   **Failure semantics**: Invalid JSON, schema violations, HTTP failures,
     business `success=false`, missing client session state, reply-send failures,
     and remote kernel error outputs make `colab drivemount` exit nonzero.
+    DriveFS history writes (`colab_request`, `drive_auth_needed`,
+    `drive_auth_failure`, and `drive_auth_success`) are best-effort: a logging
+    exception is converted to a controlled automation error but never blocks
+    the reply attempt. Each intercepted request attempts at most one reply, so
+    a reply-send exception cannot trigger a second, contradictory reply.
     `colab auth` also exits nonzero on remote kernel errors. Ordinary
     `colab exec` behavior is unchanged.
 -   **Timeout**: The kernel is silent (no iopub traffic) the entire time the

@@ -295,6 +295,188 @@ def test_drivemount_propagation_failure_sends_failure_reply_and_exits_nonzero(
 
 @patch("colab_cli.commands.automation.ColabRuntime")
 @patch("colab_cli.common.state")
+def test_failure_history_error_still_sends_one_redacted_failure_reply(
+    mock_state, mock_runtime_class, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.client.propagate_credentials.side_effect = [
+        CredentialsPropagationResult(success=True),
+        CredentialsPropagationError(
+            "token=propagation-secret "
+            "https://accounts.google.com/auth?code=authorization-secret"
+        ),
+    ]
+
+    def log_event(_name, event, _payload):
+        if event == "drive_auth_failure":
+            raise RuntimeError("history-secret must not escape")
+
+    mock_state.history.log_event.side_effect = log_event
+    mock_runtime = mock_runtime_class.return_value
+    client = wsclient()
+
+    def execute_code(*_args, **_kwargs):
+        assert mock_runtime.colab_request_hook(colab_request(), client) is True
+        return []
+
+    mock_runtime.execute_code.side_effect = execute_code
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code != 0
+    assert client.stdin_channel.send.call_count == 1
+    reply = client.stdin_channel.send.call_args.args[0]
+    assert reply["content"]["value"]["error"] == "Credentials propagation failed"
+    assert reply["parent_header"] == {}
+    rendered = repr(reply) + result.stdout + result.stderr
+    assert "propagation-secret" not in rendered
+    assert "authorization-secret" not in rendered
+    assert "history-secret" not in rendered
+    assert "accounts.google.com" not in rendered
+
+
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_colab_request_history_error_does_not_block_success_reply(
+    mock_state, mock_runtime_class, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.client.propagate_credentials.side_effect = [
+        CredentialsPropagationResult(success=True),
+        CredentialsPropagationResult(success=True),
+    ]
+
+    def log_event(_name, event, _payload):
+        if event == "colab_request":
+            raise RuntimeError("initial history failure")
+
+    mock_state.history.log_event.side_effect = log_event
+    mock_runtime = mock_runtime_class.return_value
+    client = wsclient()
+
+    def execute_code(*_args, **_kwargs):
+        assert mock_runtime.colab_request_hook(colab_request(), client) is True
+        return []
+
+    mock_runtime.execute_code.side_effect = execute_code
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code != 0
+    assert mock_state.client.propagate_credentials.call_count == 2
+    assert client.stdin_channel.send.call_count == 1
+    value = client.stdin_channel.send.call_args.args[0]["content"]["value"]
+    assert "error" not in value
+
+
+@patch("builtins.open")
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_drive_auth_needed_history_error_does_not_block_success_reply(
+    mock_state, mock_runtime_class, mock_open, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.client.propagate_credentials.side_effect = [
+        CredentialsPropagationResult(
+            success=False,
+            unauthorized_redirect_uri=(
+                "https://accounts.google.com/auth?client_id=fake-client"
+            ),
+        ),
+        CredentialsPropagationResult(success=True),
+    ]
+
+    def log_event(_name, event, _payload):
+        if event == "drive_auth_needed":
+            raise RuntimeError("authorization history failure")
+
+    mock_state.history.log_event.side_effect = log_event
+    mock_open.return_value.__enter__.return_value.readline.return_value = "\n"
+    mock_runtime = mock_runtime_class.return_value
+    client = wsclient()
+
+    def execute_code(*_args, **_kwargs):
+        assert mock_runtime.colab_request_hook(colab_request(), client) is True
+        return []
+
+    mock_runtime.execute_code.side_effect = execute_code
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code != 0
+    assert mock_state.client.propagate_credentials.call_count == 2
+    assert client.stdin_channel.send.call_count == 1
+    value = client.stdin_channel.send.call_args.args[0]["content"]["value"]
+    assert "error" not in value
+
+
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_failure_reply_send_error_is_nonzero_without_retry_or_secret_leak(
+    mock_state, mock_runtime_class, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.client.propagate_credentials.side_effect = [
+        CredentialsPropagationResult(success=True),
+        CredentialsPropagationError("propagation failed"),
+    ]
+    mock_runtime = mock_runtime_class.return_value
+    client = wsclient()
+    client.stdin_channel.send.side_effect = RuntimeError(
+        "token=reply-secret https://accounts.google.com/auth?code=reply-code"
+    )
+
+    def execute_code(*_args, **_kwargs):
+        assert mock_runtime.colab_request_hook(colab_request(), client) is True
+        return []
+
+    mock_runtime.execute_code.side_effect = execute_code
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code != 0
+    assert client.stdin_channel.send.call_count == 1
+    rendered = result.stdout + result.stderr
+    assert "reply-secret" not in rendered
+    assert "reply-code" not in rendered
+    assert "accounts.google.com" not in rendered
+
+
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_success_reply_send_error_is_nonzero_without_failure_reply_retry(
+    mock_state, mock_runtime_class, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.client.propagate_credentials.side_effect = [
+        CredentialsPropagationResult(success=True),
+        CredentialsPropagationResult(success=True),
+    ]
+    mock_runtime = mock_runtime_class.return_value
+    client = wsclient()
+    client.stdin_channel.send.side_effect = RuntimeError("sensitive reply failure")
+
+    def execute_code(*_args, **_kwargs):
+        assert mock_runtime.colab_request_hook(colab_request(), client) is True
+        return []
+
+    mock_runtime.execute_code.side_effect = execute_code
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code != 0
+    assert client.stdin_channel.send.call_count == 1
+    assert "Credentials propagated. Resuming mount" not in result.stdout
+    assert "sensitive reply failure" not in result.stderr
+
+
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
 def test_interactive_automation_history_redacts_remote_output(
     mock_state, mock_runtime_class, mock_session
 ):
@@ -339,7 +521,7 @@ def test_success_reply_is_not_followed_by_failure_reply(
 
     def log_event(_name, event, _payload):
         if event == "drive_auth_success":
-            raise RuntimeError("simulated history failure")
+            raise RuntimeError("token=success-history-secret")
 
     mock_state.history.log_event.side_effect = log_event
     mock_runtime = mock_runtime_class.return_value
@@ -358,6 +540,7 @@ def test_success_reply_is_not_followed_by_failure_reply(
     assert (
         "error" not in client.stdin_channel.send.call_args.args[0]["content"]["value"]
     )
+    assert "success-history-secret" not in result.stderr
 
 
 @pytest.mark.parametrize("command", ["drivemount", "auth"])

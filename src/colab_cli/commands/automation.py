@@ -121,6 +121,33 @@ def _raise_automation_failure(errors: List[AutomationExecutionError]):
         raise errors[0]
 
 
+_DRIVE_HISTORY_EVENTS = frozenset(
+    {
+        "colab_request",
+        "drive_auth_needed",
+        "drive_auth_failure",
+        "drive_auth_success",
+    }
+)
+
+
+def _safe_history_log_event(
+    history: Any,
+    session_name: str,
+    event: str,
+    payload: Dict[str, Any],
+    automation_errors: List[AutomationExecutionError],
+) -> None:
+    """Record DriveFS history without allowing logging to block a reply."""
+    try:
+        history.log_event(session_name, event, payload)
+    except Exception:
+        safe_event = event if event in _DRIVE_HISTORY_EVENTS else "unknown"
+        automation_errors.append(
+            AutomationExecutionError(f"History logging failed ({safe_event})")
+        )
+
+
 _SAFE_OUTPUT_TYPES = frozenset(
     {"display_data", "error", "execute_result", "status", "stream", "text"}
 )
@@ -166,10 +193,12 @@ def run_automation(
         content = deserialize_msg.get("content", {})
         if content.get("request", {}).get("authType") == "dfs_ephemeral":
             msg_id = deserialize_msg.get("metadata", {}).get("colab_msg_id")
-            state.history.log_event(
+            _safe_history_log_event(
+                state.history,
                 s.name,
                 "colab_request",
                 {"type": "dfs_ephemeral", "colab_msg_id": msg_id},
+                automation_errors,
             )
             typer.echo(
                 f"\n[colab] Intercepted Drive Auth Request. Connecting to {state.client.colab_domain}..."
@@ -192,10 +221,12 @@ def run_automation(
                         "\n[colab] REQUIRED: Google Drive Authorization needed."
                         f"\nPlease visit:\n\n{uri}\n"
                     )
-                    state.history.log_event(
+                    _safe_history_log_event(
+                        state.history,
                         s.name,
                         "drive_auth_needed",
                         uri_log_fields,
+                        automation_errors,
                     )
                     sys.stdout.write("Press Enter after you have granted access... ")
                     sys.stdout.flush()
@@ -208,41 +239,60 @@ def run_automation(
                     auth_type="dfs_ephemeral",
                     dry_run=False,
                 )
-                _send_colab_input_reply(wsclient, msg_id)
             except Exception as exc:
                 error = AutomationExecutionError(
                     f"Drive credentials propagation failed ({type(exc).__name__})"
                 )
                 automation_errors.append(error)
-                state.history.log_event(
+                try:
+                    _send_colab_input_reply(
+                        wsclient,
+                        msg_id,
+                        error="Credentials propagation failed",
+                    )
+                except Exception:
+                    automation_errors.append(
+                        AutomationExecutionError(
+                            "Drive credentials failure reply could not be sent"
+                        )
+                    )
+                _safe_history_log_event(
+                    state.history,
                     s.name,
                     "drive_auth_failure",
                     {
                         "error_category": type(exc).__name__,
                         "colab_msg_id": msg_id,
                     },
+                    automation_errors,
                 )
+            else:
                 try:
-                    _send_colab_input_reply(wsclient, msg_id, error=str(error))
-                except Exception as reply_exc:
+                    _send_colab_input_reply(wsclient, msg_id)
+                except Exception:
                     automation_errors.append(
                         AutomationExecutionError(
-                            "Drive credentials failure reply could not be sent "
-                            f"({type(reply_exc).__name__})"
+                            "Drive credentials success reply could not be sent"
                         )
                     )
-            else:
-                # The success reply has already been sent. Keep later local
-                # failures outside the propagation exception handler so this
-                # request can never receive a second, contradictory reply.
-                typer.echo("[colab] Credentials propagated. Resuming mount...")
-                try:
-                    state.history.log_event(s.name, "drive_auth_success", {})
-                except Exception as exc:
-                    automation_errors.append(
-                        AutomationExecutionError(
-                            f"Drive success logging failed ({type(exc).__name__})"
-                        )
+                    _safe_history_log_event(
+                        state.history,
+                        s.name,
+                        "drive_auth_failure",
+                        {
+                            "error_category": "ReplySendError",
+                            "colab_msg_id": msg_id,
+                        },
+                        automation_errors,
+                    )
+                else:
+                    typer.echo("[colab] Credentials propagated. Resuming mount...")
+                    _safe_history_log_event(
+                        state.history,
+                        s.name,
+                        "drive_auth_success",
+                        {},
+                        automation_errors,
                     )
             return True
         return False
