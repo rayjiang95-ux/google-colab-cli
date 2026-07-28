@@ -13,10 +13,23 @@
 # limitations under the License.
 
 from unittest.mock import patch
+
 import pytest
 from typer.testing import CliRunner
+
 from colab_cli.cli import app
+from colab_cli.client import (
+    CredentialsPropagationError,
+    CredentialsPropagationResult,
+)
+from colab_cli.commands.automation import (
+    AutomationExecutionError,
+    INTERACTIVE_AUTOMATION_TIMEOUT_SEC,
+    build_colab_input_reply,
+    describe_authorization_uri,
+)
 from colab_cli.state import SessionState
+
 
 runner = CliRunner()
 
@@ -123,3 +136,268 @@ def test_cli_auth_uses_long_timeout(mock_state, mock_runtime_class, mock_session
 
     _, kwargs = mock_runtime.execute_code.call_args
     assert kwargs.get("timeout") is not None and kwargs["timeout"] >= 300
+
+
+def test_build_colab_input_reply_success_contract():
+    reply = build_colab_input_reply(
+        client_session_id="client-session",
+        colab_msg_id=123,
+    )
+
+    assert reply["header"]["msg_type"] == "input_reply"
+    assert reply["header"]["session"] == "client-session"
+    assert reply["header"]["username"] == "username"
+    assert reply["header"]["version"] == "5.0"
+    assert reply["content"]["value"] == {
+        "type": "colab_reply",
+        "colab_msg_id": 123,
+    }
+    assert reply["channel"] == "stdin"
+    assert reply["metadata"] == {}
+    assert reply["parent_header"] == {}
+
+
+def test_build_colab_input_reply_failure_is_redacted():
+    reply = build_colab_input_reply(
+        client_session_id="client-session",
+        colab_msg_id=456,
+        error=(
+            "token=secret-token "
+            "https://accounts.google.com/o/oauth2/auth?code=secret-code"
+        ),
+    )
+
+    value = reply["content"]["value"]
+    assert value["colab_msg_id"] == 456
+    assert value["error"]
+    assert "secret-token" not in value["error"]
+    assert "secret-code" not in value["error"]
+    assert "?" not in value["error"]
+
+
+def test_describe_authorization_uri_omits_query_values():
+    description = describe_authorization_uri(
+        "https://accounts.google.com/o/oauth2/auth"
+        "?client_id=secret-client&code=secret-code&scope=drive"
+    )
+
+    assert description == {
+        "scheme": "https",
+        "hostname": "accounts.google.com",
+        "path": "/o/oauth2/auth",
+        "query_parameter_names": ["client_id", "code", "scope"],
+    }
+    serialized = repr(description)
+    assert "secret-client" not in serialized
+    assert "secret-code" not in serialized
+
+
+@pytest.mark.parametrize("client_session_id", ["", None])
+def test_build_colab_input_reply_fails_closed_without_client_session(
+    client_session_id,
+):
+    with pytest.raises(
+        AutomationExecutionError, match="Jupyter client session ID is unavailable"
+    ):
+        build_colab_input_reply(
+            client_session_id=client_session_id,
+            colab_msg_id=123,
+        )
+
+
+def colab_request(msg_id=123):
+    return {
+        "header": {"msg_type": "colab_request", "session": "kernel-session"},
+        "content": {"request": {"authType": "dfs_ephemeral"}},
+        "metadata": {
+            "colab_request_type": "request_auth",
+            "colab_msg_id": msg_id,
+        },
+    }
+
+
+def wsclient(client_session_id="client-session"):
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    client.session.session = client_session_id
+    return client
+
+
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_drivemount_propagation_success_resumes_with_custom_reply(
+    mock_state, mock_runtime_class, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.client.propagate_credentials.side_effect = [
+        CredentialsPropagationResult(success=True),
+        CredentialsPropagationResult(success=True),
+    ]
+    mock_runtime = mock_runtime_class.return_value
+    client = wsclient()
+
+    def execute_code(*_args, **_kwargs):
+        assert mock_runtime.colab_request_hook(colab_request(), client) is True
+        return [{"text": "Mounted"}]
+
+    mock_runtime.execute_code.side_effect = execute_code
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code == 0
+    assert "Credentials propagated. Resuming mount" in result.stdout
+    assert mock_state.client.propagate_credentials.call_count == 2
+    dry_call, final_call = mock_state.client.propagate_credentials.call_args_list
+    assert dry_call.kwargs == {
+        "auth_type": "dfs_ephemeral",
+        "dry_run": True,
+    }
+    assert final_call.kwargs == {
+        "auth_type": "dfs_ephemeral",
+        "dry_run": False,
+    }
+    reply = client.stdin_channel.send.call_args.args[0]
+    assert reply["header"]["session"] == "client-session"
+    assert reply["content"]["value"]["colab_msg_id"] == 123
+    assert reply["parent_header"] == {}
+
+
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_drivemount_propagation_failure_sends_failure_reply_and_exits_nonzero(
+    mock_state, mock_runtime_class, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.client.propagate_credentials.side_effect = [
+        CredentialsPropagationResult(success=True),
+        CredentialsPropagationError("Credentials propagation unsuccessful"),
+    ]
+    mock_runtime = mock_runtime_class.return_value
+    client = wsclient()
+
+    def execute_code(*_args, **_kwargs):
+        assert mock_runtime.colab_request_hook(colab_request(), client) is True
+        return []
+
+    mock_runtime.execute_code.side_effect = execute_code
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code != 0
+    assert "Credentials propagated. Resuming mount" not in result.stdout
+    reply = client.stdin_channel.send.call_args.args[0]
+    assert reply["content"]["value"]["error"]
+    assert reply["parent_header"] == {}
+
+
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_interactive_automation_history_redacts_remote_output(
+    mock_state, mock_runtime_class, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_runtime = mock_runtime_class.return_value
+    mock_runtime.execute_code.return_value = [
+        {
+            "output_type": "error",
+            "ename": "ValueError",
+            "evalue": "token=secret-token",
+            "traceback": ["https://accounts.google.com/o/oauth2/auth?code=secret-code"],
+        }
+    ]
+
+    result = runner.invoke(app, ["auth", "-s", "test-session"])
+
+    assert result.exit_code != 0
+    result_event = next(
+        call
+        for call in mock_state.history.log_event.call_args_list
+        if call.args[1] == "automation_result"
+    )
+    payload = repr(result_event.args[2])
+    assert "secret-token" not in payload
+    assert "secret-code" not in payload
+    assert "accounts.google.com" not in payload
+    assert payload.count("ValueError") == 1
+
+
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_success_reply_is_not_followed_by_failure_reply(
+    mock_state, mock_runtime_class, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.client.propagate_credentials.side_effect = [
+        CredentialsPropagationResult(success=True),
+        CredentialsPropagationResult(success=True),
+    ]
+
+    def log_event(_name, event, _payload):
+        if event == "drive_auth_success":
+            raise RuntimeError("simulated history failure")
+
+    mock_state.history.log_event.side_effect = log_event
+    mock_runtime = mock_runtime_class.return_value
+    client = wsclient()
+
+    def execute_code(*_args, **_kwargs):
+        assert mock_runtime.colab_request_hook(colab_request(), client) is True
+        return []
+
+    mock_runtime.execute_code.side_effect = execute_code
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code != 0
+    assert client.stdin_channel.send.call_count == 1
+    assert (
+        "error" not in client.stdin_channel.send.call_args.args[0]["content"]["value"]
+    )
+
+
+@pytest.mark.parametrize("command", ["drivemount", "auth"])
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_automation_remote_error_exits_nonzero(
+    mock_state, mock_runtime_class, mock_session, command
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_runtime = mock_runtime_class.return_value
+    mock_runtime.execute_code.return_value = [
+        {
+            "output_type": "error",
+            "ename": "ValueError",
+            "evalue": "remote failed",
+            "traceback": ["ValueError: remote failed"],
+        }
+    ]
+
+    result = runner.invoke(app, [command, "-s", "test-session"])
+
+    assert result.exit_code != 0
+    assert f"Remote {command} failed (ValueError)" in result.stderr
+
+
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_drivemount_success_still_exits_zero(
+    mock_state, mock_runtime_class, mock_session
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_runtime = mock_runtime_class.return_value
+    mock_runtime.execute_code.return_value = [{"text": "Mounted"}]
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code == 0
+
+
+def test_interactive_automation_timeout_remains_600_seconds():
+    assert INTERACTIVE_AUTOMATION_TIMEOUT_SEC == 600

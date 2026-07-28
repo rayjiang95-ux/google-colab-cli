@@ -14,17 +14,20 @@
 
 import datetime
 import os
+import re
 import sys
-import json
-from typing import Optional, List
+import uuid
+from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlsplit
+
 import typer
 from rich.console import Console
 from typing_extensions import Annotated
 
-from colab_cli.runtime import ColabRuntime
+from colab_cli.client import CredentialsPropagationError
 from colab_cli.contents import ContentsClient
-from colab_cli.auth import get_credentials
-from colab_cli.utils import get_status_code, render_display_data
+from colab_cli.runtime import ColabRuntime
+from colab_cli.utils import render_display_data
 
 _console = Console()
 
@@ -37,6 +40,112 @@ _console = Console()
 # without leaving CI hangs unbounded.
 INTERACTIVE_AUTOMATION_TIMEOUT_SEC = 600
 
+
+class AutomationExecutionError(Exception):
+    """A sanitized error that must make an automation command fail."""
+
+
+def describe_authorization_uri(uri: str) -> Dict[str, Any]:
+    """Return log-safe URL structure without query values."""
+    parsed = urlsplit(uri)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise CredentialsPropagationError(
+            "Credentials propagation returned an invalid authorization URL"
+        )
+    return {
+        "scheme": parsed.scheme,
+        "hostname": parsed.hostname,
+        "path": parsed.path,
+        "query_parameter_names": sorted({name for name, _ in parse_qsl(parsed.query)}),
+    }
+
+
+def build_colab_input_reply(
+    *,
+    client_session_id: str,
+    colab_msg_id: int,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build Colab's custom stdin reply without a Jupyter parent header."""
+    if not isinstance(client_session_id, str) or not client_session_id:
+        raise AutomationExecutionError("Jupyter client session ID is unavailable")
+    if (
+        not isinstance(colab_msg_id, int)
+        or isinstance(colab_msg_id, bool)
+        or colab_msg_id < 0
+    ):
+        raise AutomationExecutionError("Colab request message ID is invalid")
+
+    value: Dict[str, Any] = {
+        "type": "colab_reply",
+        "colab_msg_id": colab_msg_id,
+    }
+    if error is not None:
+        # Never reflect arbitrary exception text, tokens, or OAuth URLs into
+        # kernel output/history. The local diagnostic logs carry only the
+        # controlled error category.
+        value["error"] = "Credentials propagation failed"
+
+    return {
+        "header": {
+            "msg_id": str(uuid.uuid4()),
+            "msg_type": "input_reply",
+            "session": client_session_id,
+            "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "username": "username",
+            "version": "5.0",
+        },
+        "content": {"value": value},
+        "channel": "stdin",
+        "metadata": {},
+        "parent_header": {},
+    }
+
+
+def _send_colab_input_reply(
+    wsclient, colab_msg_id: int, error: Optional[str] = None
+) -> None:
+    # jupyter_client.Session.session is the ID placed in header.session on
+    # every outgoing execute message from this client.
+    client_session_id = getattr(getattr(wsclient, "session", None), "session", None)
+    reply = build_colab_input_reply(
+        client_session_id=client_session_id,
+        colab_msg_id=colab_msg_id,
+        error=error,
+    )
+    wsclient.stdin_channel.send(reply)
+
+
+def _raise_automation_failure(errors: List[AutomationExecutionError]):
+    if errors:
+        raise errors[0]
+
+
+_SAFE_OUTPUT_TYPES = frozenset(
+    {"display_data", "error", "execute_result", "status", "stream", "text"}
+)
+_SAFE_ERROR_CATEGORY = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,127}")
+
+
+def _summarize_interactive_outputs(
+    outputs: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Keep interactive history useful without persisting remote payloads."""
+    summary = []
+    for output in outputs:
+        output_type = output.get("output_type")
+        if not isinstance(output_type, str) or output_type not in _SAFE_OUTPUT_TYPES:
+            output_type = "unknown"
+        item = {"output_type": output_type}
+        if output_type == "error":
+            error_category = output.get("ename")
+            if not isinstance(
+                error_category, str
+            ) or not _SAFE_ERROR_CATEGORY.fullmatch(error_category):
+                error_category = "Error"
+            item["error_category"] = error_category
+        summary.append(item)
+    return summary
 
 
 def run_automation(
@@ -51,6 +160,7 @@ def run_automation(
 
     s = state.store.get(name)
     runtime = ColabRuntime(s.url, s.token, session_name=s.name, history=state.history)
+    automation_errors: List[AutomationExecutionError] = []
 
     def drivefs_hook(deserialize_msg, wsclient):
         content = deserialize_msg.get("content", {})
@@ -61,73 +171,79 @@ def run_automation(
                 "colab_request",
                 {"type": "dfs_ephemeral", "colab_msg_id": msg_id},
             )
-            url = f"{state.client.colab_domain}/tun/m/credentials-propagation/{s.endpoint}"
-            params = {
-                "authuser": "0",
-                "authtype": "dfs_ephemeral",
-                "version": "2",
-                "dryrun": "true",
-                "propagate": "true",
-                "record": "false",
-            }
             typer.echo(
                 f"\n[colab] Intercepted Drive Auth Request. Connecting to {state.client.colab_domain}..."
             )
 
-            creds = get_credentials(
-                state.client_oauth_config, provider=state.auth_provider
-            )
-            resp = creds.request("GET", url, params=params)
-            token = (
-                json.loads(resp.text.split("\n", 1)[-1]).get("token")
-                if get_status_code(resp) == 200
-                else None
-            )
-
-            headers = {"x-goog-colab-token": token}
-            resp = creds.request(
-                "POST",
-                url,
-                params=params,
-                headers=headers,
-                files={"file_id": (None, "empty.ipynb")},
-            )
-            data = json.loads(resp.text.split("\n", 1)[-1])
-
-            if not data.get("success"):
-                uri = data.get("unauthorized_redirect_uri")
-                typer.echo(
-                    f"\n[colab] REQUIRED: Google Drive Authorization needed.\nPlease visit:\n\n{uri}\n"
+            try:
+                dry_run_result = state.client.propagate_credentials(
+                    s.endpoint,
+                    auth_type="dfs_ephemeral",
+                    dry_run=True,
                 )
-                state.history.log_event(s.name, "drive_auth_needed", {"uri": uri})
-                sys.stdout.write("Press Enter after you have granted access... ")
-                sys.stdout.flush()
-                with open("/dev/tty") as tty:
-                    tty.readline()
+                if not dry_run_result.success:
+                    uri = dry_run_result.unauthorized_redirect_uri
+                    if not uri:
+                        raise CredentialsPropagationError(
+                            "Credentials propagation dry run did not provide authorization"
+                        )
+                    uri_log_fields = describe_authorization_uri(uri)
+                    typer.echo(
+                        "\n[colab] REQUIRED: Google Drive Authorization needed."
+                        f"\nPlease visit:\n\n{uri}\n"
+                    )
+                    state.history.log_event(
+                        s.name,
+                        "drive_auth_needed",
+                        uri_log_fields,
+                    )
+                    sys.stdout.write("Press Enter after you have granted access... ")
+                    sys.stdout.flush()
+                    with open("/dev/tty") as tty:
+                        tty.readline()
 
-            typer.echo("[colab] Authorizing VM...")
-            params["dryrun"] = "false"
-            resp = creds.request(
-                "POST",
-                url,
-                params=params,
-                headers=headers,
-                files={"file_id": (None, "empty.ipynb")},
-            )
-            if get_status_code(resp) == 200:
-                typer.echo("[colab] Credentials propagated. Resuming mount...")
-                state.history.log_event(s.name, "drive_auth_success", {})
-                reply = wsclient.session.msg(
-                    "input_reply",
-                    {"value": {"type": "colab_reply", "colab_msg_id": msg_id}},
+                typer.echo("[colab] Authorizing VM...")
+                state.client.propagate_credentials(
+                    s.endpoint,
+                    auth_type="dfs_ephemeral",
+                    dry_run=False,
                 )
-                if "header" in deserialize_msg:
-                    reply["parent_header"] = deserialize_msg["header"]
-                wsclient.stdin_channel.send(reply)
+                _send_colab_input_reply(wsclient, msg_id)
+            except Exception as exc:
+                error = AutomationExecutionError(
+                    f"Drive credentials propagation failed ({type(exc).__name__})"
+                )
+                automation_errors.append(error)
+                state.history.log_event(
+                    s.name,
+                    "drive_auth_failure",
+                    {
+                        "error_category": type(exc).__name__,
+                        "colab_msg_id": msg_id,
+                    },
+                )
+                try:
+                    _send_colab_input_reply(wsclient, msg_id, error=str(error))
+                except Exception as reply_exc:
+                    automation_errors.append(
+                        AutomationExecutionError(
+                            "Drive credentials failure reply could not be sent "
+                            f"({type(reply_exc).__name__})"
+                        )
+                    )
             else:
-                typer.echo(
-                    f"[colab] Error propagating: {get_status_code(resp)} {resp.text}"
-                )
+                # The success reply has already been sent. Keep later local
+                # failures outside the propagation exception handler so this
+                # request can never receive a second, contradictory reply.
+                typer.echo("[colab] Credentials propagated. Resuming mount...")
+                try:
+                    state.history.log_event(s.name, "drive_auth_success", {})
+                except Exception as exc:
+                    automation_errors.append(
+                        AutomationExecutionError(
+                            f"Drive success logging failed ({type(exc).__name__})"
+                        )
+                    )
             return True
         return False
 
@@ -149,8 +265,13 @@ def run_automation(
             state.history.log_event(name, "automation", {"op": op, "code": code})
 
         outputs = runtime.execute_code(code, allow_stdin=allow_stdin, timeout=timeout)
+        history_outputs = (
+            _summarize_interactive_outputs(outputs)
+            if op in {"auth", "drivemount"}
+            else outputs
+        )
         state.history.log_event(
-            name, "automation_result", {"op": op, "outputs": outputs}
+            name, "automation_result", {"op": op, "outputs": history_outputs}
         )
 
         for out in outputs:
@@ -162,16 +283,31 @@ def run_automation(
                     _console.print(text)
             elif out.get("output_type") == "error":
                 ename = out.get("ename", "Error")
-                evalue = out.get("evalue", "")
-                tb = out.get("traceback", [])
-                if tb:
-                    sys.stderr.write("".join(tb) + "\n")
+                if op in {"auth", "drivemount"}:
+                    automation_errors.append(
+                        AutomationExecutionError(f"Remote {op} failed ({ename})")
+                    )
                 else:
-                    sys.stderr.write(f"{ename}: {evalue}\n")
+                    evalue = out.get("evalue", "")
+                    tb = out.get("traceback", [])
+                    if tb:
+                        sys.stderr.write("".join(tb) + "\n")
+                    else:
+                        sys.stderr.write(f"{ename}: {evalue}\n")
+
+        _raise_automation_failure(automation_errors)
     finally:
         s.running = None
         state.store.add(s)
         runtime.stop()
+
+
+def _run_interactive_automation(*args, **kwargs) -> None:
+    try:
+        run_automation(*args, **kwargs)
+    except AutomationExecutionError as exc:
+        typer.echo(f"[colab] {exc}", err=True)
+        raise typer.Exit(1) from exc
 
 
 def auth(
@@ -185,7 +321,7 @@ def auth(
     name = state.resolve_session(session)
     code = "import os\nos.environ['USE_AUTH_EPHEM'] = '0'\nfrom google.colab import auth\nauth.authenticate_user()"
     typer.echo(f"[colab] Starting Google Auth flow on {name}...")
-    run_automation(
+    _run_interactive_automation(
         name,
         "auth",
         code,
@@ -206,7 +342,7 @@ def drivemount(
     name = state.resolve_session(session)
     code = f"from google.colab import drive\ndrive.mount('{path}')"
     typer.echo(f"[colab] Mounting Google Drive to '{path}' on {name}...")
-    run_automation(
+    _run_interactive_automation(
         name,
         "drivemount",
         code,

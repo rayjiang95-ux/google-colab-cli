@@ -1,5 +1,6 @@
 ---
 log:
+2026-07-28: Aligned DriveFS credential propagation with the current `colab-vscode` v2 contract: each dry-run/final call obtains an XSRF token then performs a bodyless POST, strictly validates `success`, uses an explicit Colab `input_reply` bound to the Jupyter client session, sends a redacted failure reply, and makes `auth`/`drivemount` exit nonzero on propagation or remote kernel errors. Added protocol, redaction, and exit-status tests; no live runtime or Drive mount was used.
 2026-06-11: Replaced the `oauth2` provider's `run_local_server()` (localhost redirect) with a remote copy-paste flow (`_run_remote_flow` in `auth.py`). The CLI now prints an authorization URL built with `redirect_uri=https://sdk.cloud.google.com/applicationdefaultauthcode.html` and `token_usage=remote`, then reads the pasted authorization code via `input()` and exchanges it with `flow.fetch_token(code=...)`. This is the same flow `gcloud auth application-default login` uses and works identically in local and remote/headless/container environments, removing the heuristic of whether to auto-open a browser. Confirmed server-side acceptance with a live GET-only check against the bundled cloud-SDK client (`764086051850-...`); the OOB redirect and a non-bundled client id were both verified to be rejected (`OOB flow has been blocked` / `redirect_uri_mismatch`). Unit tests in `tests/test_auth.py` assert no localhost server is started, the redirect URI + `token_usage=remote` are set, and the pasted code is exchanged.
 2026-06-01: Enabled `colab update --install` self-update on macOS in addition to Linux. Refactored platform check logic to keep the implementation DRY and updated both tests and documentation. Also, on these platforms, an additional message is shown recommending `colab update --install` to upgrade in place, positioned above the standard `pip`/`uv` installation command.
 2026-05-29: Added default OAuth2 client config (`oauth_config.json`) as a bundled package resource and restored fallback loading logic in `get_credentials()`. The CLI now falls back to using these default credentials when no explicit local config is found. Added `integration/repro_bundled_oauth` integration test.
@@ -135,6 +136,22 @@ remediation guidance) rather than silently after ~1 minute via the daemon.
     (`/tun/m/credentials-propagation/`), prompts the user with the Google OAuth
     consent URL if needed, and dispatches the required `colab_reply` message to
     the `stdin` channel to unlock the kernel thread.
+-   **Propagation contract**: Both dry-run and final propagation use the same
+    client helper. Each call first obtains a short-lived XSRF token, then sends
+    a bodyless POST with `X-Goog-Colab-Token` and the v2 query parameters. The
+    result is strictly validated: `success` must be a JSON boolean, and final
+    propagation succeeds only when it is `true`. The obsolete multipart
+    `file_id` body is not sent.
+-   **Reply contract**: The CLI constructs the Colab-specific `input_reply`
+    explicitly, binds `header.session` to the current Jupyter client session,
+    copies the intercepted `colab_msg_id`, and uses empty `metadata` and
+    `parent_header` objects. A propagation failure sends a generic error reply
+    so the kernel is released without exposing sensitive details.
+-   **Failure semantics**: Invalid JSON, schema violations, HTTP failures,
+    business `success=false`, missing client session state, reply-send failures,
+    and remote kernel error outputs make `colab drivemount` exit nonzero.
+    `colab auth` also exits nonzero on remote kernel errors. Ordinary
+    `colab exec` behavior is unchanged.
 -   **Timeout**: The kernel is silent (no iopub traffic) the entire time the
     user is OAuthing in their browser. To avoid the upstream 10s
     `jupyter_kernel_client` default raising `TimeoutError` mid-flow, this
