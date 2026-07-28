@@ -105,15 +105,20 @@ def build_colab_input_reply(
 def _send_colab_input_reply(
     wsclient, colab_msg_id: int, error: Optional[str] = None
 ) -> None:
+    session = getattr(wsclient, "session", None)
+    kernel_socket = getattr(wsclient, "kernel_socket", None)
+    if session is None or kernel_socket is None:
+        raise AutomationExecutionError("Jupyter websocket transport is unavailable")
+
     # jupyter_client.Session.session is the ID placed in header.session on
     # every outgoing execute message from this client.
-    client_session_id = getattr(getattr(wsclient, "session", None), "session", None)
+    client_session_id = getattr(session, "session", None)
     reply = build_colab_input_reply(
         client_session_id=client_session_id,
         colab_msg_id=colab_msg_id,
         error=error,
     )
-    wsclient.stdin_channel.send(reply)
+    session.send(kernel_socket, "stdin", reply)
 
 
 def _raise_automation_failure(errors: List[AutomationExecutionError]):

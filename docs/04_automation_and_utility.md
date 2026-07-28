@@ -1,5 +1,6 @@
 ---
 log:
+2026-07-28: Routed the custom Colab `input_reply` through the locked websocket client's low-level `WSSession.send(kernel_socket, "stdin", reply)` transport. This preserves the official envelope without adding incompatible top-level `msg_id` or `msg_type` fields, fails closed when session/socket state is unavailable, and retains single-reply and redaction guarantees.
 2026-07-28: Made DriveFS history writes best-effort so audit-backend failures cannot prevent the kernel reply. The hook now attempts at most one success or failure reply per request, records controlled logging/reply errors for a final nonzero CLI exit, and never includes the original history or reply exception text.
 2026-07-28: Aligned DriveFS credential propagation with the current `colab-vscode` v2 contract: each dry-run/final call obtains an XSRF token then performs a bodyless POST, strictly validates `success`, uses an explicit Colab `input_reply` bound to the Jupyter client session, sends a redacted failure reply, and makes `auth`/`drivemount` exit nonzero on propagation or remote kernel errors. Added protocol, redaction, and exit-status tests; no live runtime or Drive mount was used.
 2026-06-11: Replaced the `oauth2` provider's `run_local_server()` (localhost redirect) with a remote copy-paste flow (`_run_remote_flow` in `auth.py`). The CLI now prints an authorization URL built with `redirect_uri=https://sdk.cloud.google.com/applicationdefaultauthcode.html` and `token_usage=remote`, then reads the pasted authorization code via `input()` and exchanges it with `flow.fetch_token(code=...)`. This is the same flow `gcloud auth application-default login` uses and works identically in local and remote/headless/container environments, removing the heuristic of whether to auto-open a browser. Confirmed server-side acceptance with a live GET-only check against the bundled cloud-SDK client (`764086051850-...`); the OOB redirect and a non-bundled client id were both verified to be rejected (`OOB flow has been blocked` / `redirect_uri_mismatch`). Unit tests in `tests/test_auth.py` assert no localhost server is started, the redirect URI + `token_usage=remote` are set, and the pasted code is exchanged.
@@ -146,8 +147,12 @@ remediation guidance) rather than silently after ~1 minute via the daemon.
 -   **Reply contract**: The CLI constructs the Colab-specific `input_reply`
     explicitly, binds `header.session` to the current Jupyter client session,
     copies the intercepted `colab_msg_id`, and uses empty `metadata` and
-    `parent_header` objects. A propagation failure sends a generic error reply
-    so the kernel is released without exposing sensitive details.
+    `parent_header` objects. It passes that envelope directly to the locked
+    websocket client's low-level
+    `WSSession.send(kernel_socket, "stdin", reply)` transport; the higher-level
+    channel wrapper is not used because it expects incompatible top-level
+    `msg_id` and `msg_type` fields. A propagation failure sends a generic error
+    reply so the kernel is released without exposing sensitive details.
 -   **Failure semantics**: Invalid JSON, schema violations, HTTP failures,
     business `success=false`, missing client session state, reply-send failures,
     and remote kernel error outputs make `colab drivemount` exit nonzero.

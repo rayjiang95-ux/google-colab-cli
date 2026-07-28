@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import patch
+import json
+from unittest.mock import MagicMock, patch
 
+from jupyter_kernel_client.wsclient import JupyterSubprotocol, WSSession
 import pytest
 from typer.testing import CliRunner
 
@@ -25,6 +27,7 @@ from colab_cli.client import (
 from colab_cli.commands.automation import (
     AutomationExecutionError,
     INTERACTIVE_AUTOMATION_TIMEOUT_SEC,
+    _send_colab_input_reply,
     build_colab_input_reply,
     describe_authorization_uri,
 )
@@ -175,6 +178,113 @@ def test_build_colab_input_reply_failure_is_redacted():
     assert "?" not in value["error"]
 
 
+def test_send_colab_input_reply_uses_websocket_session_transport():
+    client = wsclient()
+
+    _send_colab_input_reply(client, colab_msg_id=123)
+
+    client.session.send.assert_called_once()
+    kernel_socket, channel, reply = client.session.send.call_args.args
+    assert kernel_socket is client.kernel_socket
+    assert channel == "stdin"
+    assert "msg_id" not in reply
+    assert "msg_type" not in reply
+    assert reply["header"]["msg_id"]
+    assert reply["header"]["msg_type"] == "input_reply"
+    assert reply["header"]["session"] == "client-session"
+    assert reply["channel"] == "stdin"
+    assert reply["parent_header"] == {}
+    assert reply["metadata"] == {}
+    client.stdin_channel.send.assert_not_called()
+
+
+def test_send_colab_failure_reply_uses_redacted_session_transport():
+    client = wsclient()
+
+    _send_colab_input_reply(
+        client,
+        colab_msg_id=456,
+        error=("token=secret-token https://accounts.google.com/auth?code=secret-code"),
+    )
+
+    client.session.send.assert_called_once()
+    reply = client.session.send.call_args.args[2]
+    assert reply["content"]["value"]["error"] == "Credentials propagation failed"
+    rendered = repr(reply)
+    assert "secret-token" not in rendered
+    assert "secret-code" not in rendered
+    assert "accounts.google.com" not in rendered
+    client.stdin_channel.send.assert_not_called()
+
+
+def test_real_websocket_session_serializes_official_reply_contract():
+    class FakeStream:
+        def __init__(self):
+            self.sent = []
+
+        def send_text(self, value):
+            self.sent.append(value)
+
+    session = WSSession(
+        subprotocol=JupyterSubprotocol.DEFAULT,
+        session="client-session",
+    )
+    stream = FakeStream()
+    reply = build_colab_input_reply(
+        client_session_id="client-session",
+        colab_msg_id=123,
+    )
+
+    session.send(stream, "stdin", reply)
+
+    assert len(stream.sent) == 1
+    wire = json.loads(stream.sent[0])
+    assert wire == reply
+    assert "msg_id" not in wire
+    assert "msg_type" not in wire
+    assert wire["header"]["msg_id"]
+    assert wire["header"]["msg_type"] == "input_reply"
+    assert wire["header"]["session"] == "client-session"
+    assert wire["content"]["value"] == {
+        "type": "colab_reply",
+        "colab_msg_id": 123,
+    }
+    assert wire["channel"] == "stdin"
+    assert wire["metadata"] == {}
+    assert wire["parent_header"] == {}
+
+
+@pytest.mark.parametrize("missing", ["session", "kernel_socket"])
+@patch("colab_cli.commands.automation.ColabRuntime")
+@patch("colab_cli.common.state")
+def test_drivemount_missing_websocket_transport_fails_closed(
+    mock_state, mock_runtime_class, mock_session, missing
+):
+    mock_state.store.get.return_value = mock_session
+    mock_state.resolve_session.return_value = "test-session"
+    mock_state.client.propagate_credentials.side_effect = [
+        CredentialsPropagationResult(success=True),
+        CredentialsPropagationResult(success=True),
+    ]
+    mock_runtime = mock_runtime_class.return_value
+    client = wsclient()
+    transport_session = client.session
+    setattr(client, missing, None)
+
+    def execute_code(*_args, **_kwargs):
+        assert mock_runtime.colab_request_hook(colab_request(), client) is True
+        return []
+
+    mock_runtime.execute_code.side_effect = execute_code
+
+    result = runner.invoke(app, ["drivemount", "-s", "test-session"])
+
+    assert result.exit_code != 0
+    assert "Credentials propagated. Resuming mount" not in result.stdout
+    transport_session.send.assert_not_called()
+    client.stdin_channel.send.assert_not_called()
+
+
 def test_describe_authorization_uri_omits_query_values():
     description = describe_authorization_uri(
         "https://accounts.google.com/o/oauth2/auth"
@@ -217,10 +327,9 @@ def colab_request(msg_id=123):
 
 
 def wsclient(client_session_id="client-session"):
-    from unittest.mock import MagicMock
-
     client = MagicMock()
     client.session.session = client_session_id
+    client.kernel_socket = MagicMock(name="kernel_socket")
     return client
 
 
@@ -258,10 +367,12 @@ def test_drivemount_propagation_success_resumes_with_custom_reply(
         "auth_type": "dfs_ephemeral",
         "dry_run": False,
     }
-    reply = client.stdin_channel.send.call_args.args[0]
+    client.session.send.assert_called_once()
+    reply = client.session.send.call_args.args[2]
     assert reply["header"]["session"] == "client-session"
     assert reply["content"]["value"]["colab_msg_id"] == 123
     assert reply["parent_header"] == {}
+    client.stdin_channel.send.assert_not_called()
 
 
 @patch("colab_cli.commands.automation.ColabRuntime")
@@ -288,9 +399,11 @@ def test_drivemount_propagation_failure_sends_failure_reply_and_exits_nonzero(
 
     assert result.exit_code != 0
     assert "Credentials propagated. Resuming mount" not in result.stdout
-    reply = client.stdin_channel.send.call_args.args[0]
+    client.session.send.assert_called_once()
+    reply = client.session.send.call_args.args[2]
     assert reply["content"]["value"]["error"]
     assert reply["parent_header"] == {}
+    client.stdin_channel.send.assert_not_called()
 
 
 @patch("colab_cli.commands.automation.ColabRuntime")
@@ -325,10 +438,11 @@ def test_failure_history_error_still_sends_one_redacted_failure_reply(
     result = runner.invoke(app, ["drivemount", "-s", "test-session"])
 
     assert result.exit_code != 0
-    assert client.stdin_channel.send.call_count == 1
-    reply = client.stdin_channel.send.call_args.args[0]
+    assert client.session.send.call_count == 1
+    reply = client.session.send.call_args.args[2]
     assert reply["content"]["value"]["error"] == "Credentials propagation failed"
     assert reply["parent_header"] == {}
+    client.stdin_channel.send.assert_not_called()
     rendered = repr(reply) + result.stdout + result.stderr
     assert "propagation-secret" not in rendered
     assert "authorization-secret" not in rendered
@@ -366,9 +480,10 @@ def test_colab_request_history_error_does_not_block_success_reply(
 
     assert result.exit_code != 0
     assert mock_state.client.propagate_credentials.call_count == 2
-    assert client.stdin_channel.send.call_count == 1
-    value = client.stdin_channel.send.call_args.args[0]["content"]["value"]
+    assert client.session.send.call_count == 1
+    value = client.session.send.call_args.args[2]["content"]["value"]
     assert "error" not in value
+    client.stdin_channel.send.assert_not_called()
 
 
 @patch("builtins.open")
@@ -408,9 +523,10 @@ def test_drive_auth_needed_history_error_does_not_block_success_reply(
 
     assert result.exit_code != 0
     assert mock_state.client.propagate_credentials.call_count == 2
-    assert client.stdin_channel.send.call_count == 1
-    value = client.stdin_channel.send.call_args.args[0]["content"]["value"]
+    assert client.session.send.call_count == 1
+    value = client.session.send.call_args.args[2]["content"]["value"]
     assert "error" not in value
+    client.stdin_channel.send.assert_not_called()
 
 
 @patch("colab_cli.commands.automation.ColabRuntime")
@@ -426,7 +542,7 @@ def test_failure_reply_send_error_is_nonzero_without_retry_or_secret_leak(
     ]
     mock_runtime = mock_runtime_class.return_value
     client = wsclient()
-    client.stdin_channel.send.side_effect = RuntimeError(
+    client.session.send.side_effect = RuntimeError(
         "token=reply-secret https://accounts.google.com/auth?code=reply-code"
     )
 
@@ -439,7 +555,8 @@ def test_failure_reply_send_error_is_nonzero_without_retry_or_secret_leak(
     result = runner.invoke(app, ["drivemount", "-s", "test-session"])
 
     assert result.exit_code != 0
-    assert client.stdin_channel.send.call_count == 1
+    assert client.session.send.call_count == 1
+    client.stdin_channel.send.assert_not_called()
     rendered = result.stdout + result.stderr
     assert "reply-secret" not in rendered
     assert "reply-code" not in rendered
@@ -459,7 +576,7 @@ def test_success_reply_send_error_is_nonzero_without_failure_reply_retry(
     ]
     mock_runtime = mock_runtime_class.return_value
     client = wsclient()
-    client.stdin_channel.send.side_effect = RuntimeError("sensitive reply failure")
+    client.session.send.side_effect = RuntimeError("sensitive reply failure")
 
     def execute_code(*_args, **_kwargs):
         assert mock_runtime.colab_request_hook(colab_request(), client) is True
@@ -470,7 +587,8 @@ def test_success_reply_send_error_is_nonzero_without_failure_reply_retry(
     result = runner.invoke(app, ["drivemount", "-s", "test-session"])
 
     assert result.exit_code != 0
-    assert client.stdin_channel.send.call_count == 1
+    assert client.session.send.call_count == 1
+    client.stdin_channel.send.assert_not_called()
     assert "Credentials propagated. Resuming mount" not in result.stdout
     assert "sensitive reply failure" not in result.stderr
 
@@ -536,10 +654,9 @@ def test_success_reply_is_not_followed_by_failure_reply(
     result = runner.invoke(app, ["drivemount", "-s", "test-session"])
 
     assert result.exit_code != 0
-    assert client.stdin_channel.send.call_count == 1
-    assert (
-        "error" not in client.stdin_channel.send.call_args.args[0]["content"]["value"]
-    )
+    assert client.session.send.call_count == 1
+    assert "error" not in client.session.send.call_args.args[2]["content"]["value"]
+    client.stdin_channel.send.assert_not_called()
     assert "success-history-secret" not in result.stderr
 
 

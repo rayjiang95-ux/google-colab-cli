@@ -23,7 +23,7 @@ The comparison covers the CLI's `client.py`, `commands/automation.py`,
 | Result response schema | Loosely parsed dictionary | Required boolean `success`; optional string redirect URI | `CredentialsPropagationResult` with `StrictBool` and optional `StrictStr` |
 | XSSI handling | Manually split in automation code | Common response parsing | Existing client XSSI stripping before strict validation |
 | Success decision | Final HTTP 200 alone | Valid response with `success === true` | Valid response with `success is True`; final `false` raises |
-| Kernel success reply | Generated through the standard Jupyter message helper | Explicit Colab `input_reply` envelope | Explicit `build_colab_input_reply` envelope |
+| Kernel success reply | Generated through the standard Jupyter message helper | Explicit Colab `input_reply` envelope | Explicit `build_colab_input_reply` envelope sent through `WSSession.send(kernel_socket, "stdin", reply)` |
 | Failure reply | No reply on propagation HTTP failure | `content.value.error` is set | Sends a generic, redacted `content.value.error` |
 | Client session ID source | Implicit helper state; request header could become the parent | Client-side Jupyter session used for outgoing messages | `wsclient.session.session`, the ID placed in outgoing `header.session` |
 | `parent_header` | Could be replaced by the intercepted request header | `{}` | `{}` |
@@ -47,9 +47,13 @@ Colab-specific fields are explicit:
 - `channel` is `stdin`; `metadata` and `parent_header` are empty objects.
 - Failures add only the generic `content.value.error` string
   `Credentials propagation failed`.
+- The complete envelope is sent through the websocket session with the kernel
+  socket and `stdin` channel. No duplicate top-level `msg_id` or `msg_type`
+  fields are added.
 
-If the client session ID or Colab message ID is unavailable or invalid, reply
-construction fails closed and the interactive CLI command exits nonzero.
+If the websocket session, kernel socket, client session ID, or Colab message
+ID is unavailable or invalid, reply construction/sending fails closed and the
+interactive CLI command exits nonzero.
 
 ## Security boundary
 
