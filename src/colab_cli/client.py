@@ -22,7 +22,14 @@ from urllib.parse import urljoin, urlparse
 import uuid
 
 from colab_cli.utils import get_status_code
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictBool,
+    StrictStr,
+    TypeAdapter,
+    ValidationError,
+)
 import requests
 
 # Standard Colab Headers
@@ -127,6 +134,15 @@ class GetUnassignRequest(BaseModel):
     token: str
 
 
+class CredentialsPropagationToken(BaseModel):
+    token: StrictStr
+
+
+class CredentialsPropagationResult(BaseModel):
+    success: StrictBool
+    unauthorized_redirect_uri: Optional[StrictStr] = None
+
+
 class Assignment(BaseModel):
     endpoint: str
     runtime_proxy_info: RuntimeProxyInfo = Field(..., alias="runtimeProxyInfo")
@@ -144,8 +160,33 @@ class ColabRequestError(Exception):
         self.response_body = response_body
 
 
+class CredentialsPropagationError(Exception):
+    """A sanitized Drive credentials-propagation failure."""
+
+
 class TooManyAssignmentsError(Exception):
     pass
+
+
+_SENSITIVE_HEADER_NAMES = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "set-cookie",
+        "x-colab-runtime-proxy-token",
+        "x-goog-colab-token",
+    }
+)
+
+
+def _redact_headers(headers) -> Dict[str, str]:
+    return {
+        str(key): "[REDACTED]"
+        if str(key).lower() in _SENSITIVE_HEADER_NAMES
+        else str(value)
+        for key, value in dict(headers or {}).items()
+    }
 
 
 class Client:
@@ -188,10 +229,12 @@ class Client:
             method, endpoint, headers=request_headers, params=params, **kwargs
         )
 
-        self.logger.debug(f"Request Headers: {response.request.headers}")
+        self.logger.debug(
+            f"Request Headers: {_redact_headers(response.request.headers)}"
+        )
         self.logger.debug(f"Response: {response.status_code} {response.reason}")
-        self.logger.debug(f"Response Headers: {response.headers}")
-        self.logger.debug(f"Response Body: {response.text}")
+        self.logger.debug(f"Response Headers: {_redact_headers(response.headers)}")
+        self.logger.debug(f"Response Body: <{len(response.text or '')} bytes>")
         if not response.ok:
             raise ColabRequestError(
                 f"Failed to issue request {method} {endpoint}: {response.reason}",
@@ -222,6 +265,60 @@ class Client:
         return self._issue_request(
             url, method="POST", headers=headers, schema=BaseModel
         )
+
+    def propagate_credentials(
+        self,
+        endpoint: str,
+        *,
+        auth_type: str,
+        dry_run: bool,
+    ) -> CredentialsPropagationResult:
+        """Propagate ephemeral credentials using the supported v2 contract."""
+        url = urljoin(
+            self.colab_domain,
+            f"{TUN_ENDPOINT}/credentials-propagation/{endpoint}",
+        )
+        params = {
+            "authtype": auth_type,
+            "version": "2",
+            "dryrun": str(dry_run).lower(),
+            "propagate": "true",
+            "record": "false",
+        }
+        try:
+            token_response = self._issue_request(
+                url,
+                method="GET",
+                params=params,
+                schema=CredentialsPropagationToken,
+            )
+            result = self._issue_request(
+                url,
+                method="POST",
+                params=params,
+                headers={
+                    COLAB_XSRF_TOKEN_HEADER["key"]: token_response.token,
+                },
+                schema=CredentialsPropagationResult,
+            )
+        except ColabRequestError as exc:
+            status = get_status_code(exc)
+            raise CredentialsPropagationError(
+                f"Credentials propagation request failed (HTTP {status})"
+            ) from exc
+        except (
+            json.JSONDecodeError,
+            ValidationError,
+            TypeError,
+            AttributeError,
+        ) as exc:
+            raise CredentialsPropagationError(
+                "Credentials propagation returned an invalid response"
+            ) from exc
+
+        if not dry_run and not result.success:
+            raise CredentialsPropagationError("Credentials propagation unsuccessful")
+        return result
 
     def assign(
         self,

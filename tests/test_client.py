@@ -16,7 +16,17 @@ import uuid
 import json
 import pytest
 from unittest.mock import MagicMock
-from colab_cli.client import Client, Prod, PostAssignmentResponse, Assignment
+from colab_cli.client import (
+    Assignment,
+    Client,
+    CredentialsPropagationError,
+    CredentialsPropagationResult,
+    PostAssignmentResponse,
+    Prod,
+)
+
+
+XSSI = ")]}'\n"
 
 
 @pytest.fixture
@@ -27,6 +37,24 @@ def mock_session():
 @pytest.fixture
 def client(mock_session):
     return Client(Prod(), mock_session)
+
+
+def response(body, *, status=200, reason="OK"):
+    result = MagicMock()
+    result.ok = 200 <= status < 300
+    result.status_code = status
+    result.reason = reason
+    result.text = body
+    result.request.headers = {}
+    result.headers = {}
+    return result
+
+
+def propagation_responses(body, *, status=200):
+    return [
+        response(XSSI + json.dumps({"token": "secret-xsrf"})),
+        response(body, status=status),
+    ]
 
 
 def test_client_assign_new(client, mock_session):
@@ -234,3 +262,140 @@ def test_client_keep_alive_assignment_propagates_http_error(client, mock_session
 
     with pytest.raises(ColabRequestError):
         client.keep_alive_assignment("m-s-test-endpoint")
+
+
+def test_credentials_propagation_success_true(client, mock_session):
+    mock_session.request.side_effect = propagation_responses(
+        XSSI + json.dumps({"success": True})
+    )
+
+    result = client.propagate_credentials(
+        "m-s-test", auth_type="dfs_ephemeral", dry_run=False
+    )
+
+    assert result == CredentialsPropagationResult(success=True)
+
+
+def test_credentials_propagation_success_false_fails_final(client, mock_session):
+    mock_session.request.side_effect = propagation_responses(
+        XSSI
+        + json.dumps(
+            {
+                "success": False,
+                "unauthorized_redirect_uri": "https://accounts.google.com/consent?secret=value",
+            }
+        )
+    )
+
+    with pytest.raises(CredentialsPropagationError, match="unsuccessful"):
+        client.propagate_credentials(
+            "m-s-test", auth_type="dfs_ephemeral", dry_run=False
+        )
+
+
+def test_credentials_propagation_success_false_allowed_for_dry_run(
+    client, mock_session
+):
+    redirect = "https://accounts.google.com/consent?secret=value"
+    mock_session.request.side_effect = propagation_responses(
+        XSSI + json.dumps({"success": False, "unauthorized_redirect_uri": redirect})
+    )
+
+    result = client.propagate_credentials(
+        "m-s-test", auth_type="dfs_ephemeral", dry_run=True
+    )
+
+    assert result.success is False
+    assert result.unauthorized_redirect_uri == redirect
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "not-json",
+        XSSI + json.dumps({}),
+        XSSI + json.dumps({"success": "true"}),
+    ],
+)
+def test_credentials_propagation_rejects_invalid_response(client, mock_session, body):
+    mock_session.request.side_effect = propagation_responses(body)
+
+    with pytest.raises(CredentialsPropagationError, match="invalid response"):
+        client.propagate_credentials(
+            "m-s-test", auth_type="dfs_ephemeral", dry_run=False
+        )
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_credentials_propagation_rejects_http_error(client, mock_session, status):
+    mock_session.request.side_effect = propagation_responses(
+        "unauthorized", status=status
+    )
+
+    with pytest.raises(CredentialsPropagationError, match="request failed"):
+        client.propagate_credentials(
+            "m-s-test", auth_type="dfs_ephemeral", dry_run=False
+        )
+
+
+def test_credentials_propagation_parses_xssi_prefix(client, mock_session):
+    mock_session.request.side_effect = propagation_responses(
+        XSSI + json.dumps({"success": True})
+    )
+
+    result = client.propagate_credentials(
+        "m-s-test", auth_type="dfs_ephemeral", dry_run=False
+    )
+
+    assert result.success is True
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_credentials_propagation_request_contract(client, mock_session, dry_run):
+    mock_session.request.side_effect = propagation_responses(
+        XSSI + json.dumps({"success": True})
+    )
+
+    client.propagate_credentials("m-s-test", auth_type="dfs_ephemeral", dry_run=dry_run)
+
+    assert mock_session.request.call_count == 2
+    get_call, post_call = mock_session.request.call_args_list
+    expected_params = {
+        "authuser": "0",
+        "authtype": "dfs_ephemeral",
+        "version": "2",
+        "dryrun": str(dry_run).lower(),
+        "propagate": "true",
+        "record": "false",
+    }
+    assert get_call.args[0] == "GET"
+    assert get_call.kwargs["params"] == expected_params
+    assert post_call.args[0] == "POST"
+    assert post_call.kwargs["params"] == expected_params
+    assert post_call.kwargs["headers"]["X-Goog-Colab-Token"] == "secret-xsrf"
+    assert "files" not in post_call.kwargs
+    assert "data" not in post_call.kwargs
+    assert "json" not in post_call.kwargs
+
+
+def test_credentials_propagation_token_is_redacted_from_logs(mock_session):
+    logger = MagicMock()
+    client = Client(Prod(), mock_session, logger=logger)
+    get_response, post_response = propagation_responses(
+        XSSI + json.dumps({"success": True})
+    )
+    post_response.request.headers = {
+        "X-Goog-Colab-Token": "secret-xsrf",
+        "Cookie": "secret-cookie",
+    }
+    mock_session.request.side_effect = [get_response, post_response]
+
+    client.propagate_credentials("m-s-test", auth_type="dfs_ephemeral", dry_run=False)
+
+    logged = "\n".join(
+        str(call.args[0]) for call in logger.debug.call_args_list if call.args
+    )
+    assert "secret-xsrf" not in logged
+    assert "secret-cookie" not in logged
+    assert "X-Goog-Colab-Token" in logged
+    assert "[REDACTED]" in logged
