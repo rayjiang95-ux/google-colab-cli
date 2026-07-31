@@ -26,8 +26,10 @@ by running `uv tool install google-colab-cli` or `pip install google-colab-cli`.
 - **`colab` is fire-and-forget.** Each command authenticates, does one thing, and exits. A detached background daemon (spawned by `colab new`) handles keep-alive; you don't manage it.
 
 ## Authentication (the #1 thing that blocks agents)
-- The global flag is `--auth={adc,oauth2}` and the **default is `adc`** (Application Default Credentials). It must come *before* the subcommand: `colab --auth=adc new -s x`.
-- **ADC setup** (most reliable for headless/agent use). The Colab backends need a specific scope set, so re-mint ADC with all four scopes:
+- The global flag is `--auth={oauth2,adc}` and the **default is `oauth2`**. It must come before the subcommand: `colab --auth=oauth2 new -s x`.
+- **OAuth2** uses the bundled public client configuration unless `-c PATH` is supplied. First use needs a human copy-paste browser flow; later calls use the cached credential at `~/.config/colab-cli/token.json`. Agents must never read, print, copy, or modify that file.
+- For a fail-closed headless gate, run `colab --auth=oauth2 whoami </dev/null`. A valid cached credential returns the identity; a missing or unusable credential fails instead of accepting pasted input. Stop and ask the user if interaction is required.
+- **ADC** is an optional alternative when the operator has already configured `gcloud`. The Colab backends need this scope set:
   ```bash
   gcloud auth application-default login \
     --scopes=openid,\
@@ -35,16 +37,27 @@ by running `uv tool install google-colab-cli` or `pip install google-colab-cli`.
   https://www.googleapis.com/auth/userinfo.email,\
   https://www.googleapis.com/auth/colaboratory
   ```
-  Why all four: `userinfo.email` (session backend `colab.research.google.com`, else 401), `colaboratory` (RuntimeService `colab.pa.googleapis.com` keep-alive, else 403), `openid`+`cloud-platform` (mandated by gcloud itself; it rejects scope lists missing `cloud-platform`).
-- **oauth2 setup**: `colab --auth=oauth2 <anything>` triggers a browser consent flow on first use (token cached at `~/.config/colab-cli/token.json`). Requires a client config at `~/.colab-cli-oauth-config.json` (or `-c PATH`). The browser step means it usually needs a human; prefer ADC for agents.
-- **Verify auth in one shot**: `colab sessions` (read-only, lists server assignments) or `colab whoami` (hidden debug command: prints the active email, scopes, audience, and expiry). When any call 403s against `colab.pa.googleapis.com`, the cause is almost always a missing scope — `colab whoami` shows it instantly.
-- **`colab new` pre-flights the keep-alive RPC** right after allocating. If your token lacks the `colaboratory` scope it unassigns the fresh VM (so you don't leak a billable assignment) and prints the exact remediation. Follow that message rather than retrying blindly.
-- **Do NOT confuse `colab auth` with CLI authentication.** `colab auth` injects *VM-side* GCP credentials into the running kernel (so notebook code can call BigQuery/GCS); it is orthogonal to how the CLI itself authenticates. Never suggest "run `colab auth`" to fix a CLI 401/403 — that's a scope/identity problem fixed via the `gcloud` command above.
+  `openid` and `cloud-platform` are required by `gcloud`; `userinfo.email` is required by the session backend; `colaboratory` is retained for Colab compatibility.
+- **Verify auth in one shot** with `colab whoami`; when an expected account matters, compare its `Email:` line before allocating.
+- **Do not confuse `colab auth` with CLI authentication.** `colab auth` injects VM-side GCP credentials for notebook code. It does not fix CLI OAuth2 or ADC failures.
+
+## Agent execution contract
+- Use the absolute CLI path supplied by the operator. Do not assume a bare `colab` resolves to the intended installation.
+- Default to CPU. Allocate GPU/TPU only when the user explicitly approves that resource and its possible cost.
+- Give every run a unique session name and `--config` file. Global options precede the subcommand:
+  ```bash
+  "$COLAB" --auth=oauth2 --config "$STATE_DIR/sessions.json" new -s "$SESSION"
+  ```
+- One agent owns one session. Never reuse, stop, or clean up another agent's session, including an orphan shown by `colab sessions`.
+- Install a shell cleanup trap immediately after allocation and always stop with the same `--auth`, `--config`, and `-s` values on success, failure, timeout, or interruption.
+- Verify both layers: the local return code and an expected remote marker/result. Treat a traceback, timeout, or missing result as failure even when wrapper output looks successful.
+- Browser login, `colab auth`, and `colab drivemount` require a human. Pause before them and perform at most the explicitly approved attempt; never ask the user to paste a token or authorization code into chat.
+- Project policy remains authoritative. This skill does not grant permission to access data, call external APIs, allocate accelerators, publish changes, or create formal run identifiers.
 
 ## Workflow
 
 ### Provision
-- `colab new -s <name>` (CPU). Add `--gpu A100` or `--tpu v6e1` for accelerators. **Always pass `-s <name>`** — an omitted name is auto-generated as a random 6-hex string, which makes later commands ambiguous.
+- `colab new -s <name>` provisions CPU by default. Add `--gpu` or `--tpu` only with explicit operator approval. **Always pass `-s <name>`** — an omitted name is auto-generated as a random 6-hex string, which makes later commands ambiguous.
 - Supported `--gpu`: `T4`, `L4`, `G4`, `H100`, `A100`. Supported `--tpu`: `v5e1`, `v6e1`.
 - **Gotcha**: an unrecognized `--gpu` value silently falls back to **A100** (which then usually fails the next step). A `400` on `colab new` with an accelerator means no quota/entitlement for it on this account — fall back to `--gpu T4` or omit the flag for CPU.
 - Accelerator availability is tier-gated; most accounts can only get CPU. Don't assume a GPU/TPU will allocate.
@@ -81,7 +94,7 @@ by running `uv tool install google-colab-cli` or `pip install google-colab-cli`.
 ## Safety
 - **Always `colab stop -s <name>` when done** — idle VMs burn compute units. `colab run` (without `--keep`) self-cleans even if the script errors.
 - Local state lives in `~/.config/colab-cli/sessions.json` (settings in `settings.json`, history in `history/*.jsonl`). Don't edit by hand.
-- **Isolate parallel/agent runs** with the global `--config <path>` flag to point session state at a scratch file (e.g. `colab --config /tmp/agent.json new -s job`). The keep-alive daemon inherits `--auth` and `--config` automatically.
+- **Isolate parallel/agent runs** with the global `--config <path>` flag to point session state at a private scratch file (e.g. `colab --config "$STATE_DIR/sessions.json" new -s "$SESSION"`). The keep-alive daemon inherits `--auth` and `--config` automatically.
 
 ## Recovery
 - "Session not found" / 404 / 401 on exec: the backend pruned the VM. `colab exec`/`repl` detect this and clean up local state automatically — run `colab sessions` and re-create with `colab new`.
