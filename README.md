@@ -58,6 +58,26 @@ colab stop
 > When only one session is active, you can omit the `-s, --session` option;
 > the CLI automatically knows it.
 
+### AI agent quick start
+
+The installed package includes a portable operator contract. Before an agent
+allocates a runtime, have it run `colab skill` or read
+[`skills/colab-operator/SKILL.md`](skills/colab-operator/SKILL.md).
+
+A minimal handoff is enough:
+
+```text
+Use this repository's colab-operator skill to run <task>.
+Use the absolute colab path I provide, create a unique CPU session and state
+file, verify the remote result, and stop only that session when finished.
+Pause for me before any browser interaction, Drive mount, VM-side cloud auth,
+GPU/TPU allocation, or other cost-bearing action.
+```
+
+The operator should provide project-specific restrictions separately. Do not
+put credentials, account emails, tokens, or machine-specific paths in a shared
+handoff file.
+
 
 ---
 
@@ -105,7 +125,7 @@ Run `colab <command> --help` to view specific options, defaults, and detailed he
 | `colab update [--install]` | Check for a newer release (and optionally upgrade the CLI in place) |
 
 ### Global Options
-* `--auth {oauth2,adc}` — Authentication strategy for the Colab API (default: `adc`).
+* `--auth {oauth2,adc}` — Authentication strategy for the Colab API (default: `oauth2`).
 * `-c, --client-oauth-config PATH` — Path to public OAuth client credentials configuration (default: `~/.colab-cli-oauth-config.json`).
 * `--config PATH` — Path to local session metadata storage (default: `~/.config/colab-cli/sessions.json`).
 * `--logtostderr` — Direct debug logging output to stderr.

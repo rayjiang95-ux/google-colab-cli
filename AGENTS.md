@@ -30,6 +30,19 @@
     - `uv run` ensures the `colab` command (entry point) is available in the shell environment.
 - **Continuous Improvement**: Whenever the user provides feedback, workflow advice, or corrections, immediately encode that advice into this `AGENTS.md` file. The goal is to learn from review and never repeat the same errors.
 
+## Downstream Agent Routing
+- Agents using the CLI to run another project should read
+  `skills/colab-operator/SKILL.md`; this file governs contributors to the CLI
+  itself. `colab skill` prints the packaged operator guidance after install.
+- Keep downstream guidance portable. Do not commit a user's email, local CLI
+  path, token path contents, project-specific policy, or credentials here.
+- Prefer a small execution contract over framework-specific wrappers: an
+  operator supplies the task, local CLI path, auth choice, resource approval,
+  and any project policy. The skill supplies session isolation, interaction,
+  verification, and cleanup rules.
+- When CLI behavior relevant to operators changes, update the bundled skill and
+  its README entry in the same change.
+
 ## Tools & Workflow
 - **Workflow**:
     1.  **Draft**: Plan and start the task. Create a new git branch before working on new features or changes.
